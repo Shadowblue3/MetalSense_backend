@@ -54,7 +54,7 @@ def get_mongo_client():
     """Get or create MongoDB client connection"""
     global _mongo_client
     if _mongo_client is None:
-        uri = os.environ.get("MONGO_URI") or "mongodb+srv://setudeyindia_db_user:G8z0myA0G7D9Hiwt@cluster0.pw3lt0s.mongodb.net/metal_pollution"
+        uri = os.environ.get("MONGO_URI") or "mongodb+srv://shadowblue976_db_user:iWBGGI4i3chxfTXW@metalsense.ldwosxe.mongodb.net/metal/Disease_Data/"
         if uri.endswith('/'):
             uri = uri[:-1]
         _mongo_client = MongoClient(uri, maxPoolSize=10, minPoolSize=1)

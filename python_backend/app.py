@@ -8,8 +8,12 @@ from functools import lru_cache
 from datetime import datetime
 import gc
 import numpy as np
+import io
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
-from flask import Flask, jsonify, send_from_directory, request
+from flask import Flask, jsonify, send_from_directory, request, make_response
 from flask_cors import CORS
 import pandas as pd
 import folium
@@ -22,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 # Global MongoDB client
 _mongo_client = None
+# Cache for last generated map HTML (served at /api/map)
+_last_map_html = None
 
 # Heavy metal background reference values (mg/kg) - typical soil background values
 BACKGROUND_VALUES = {
@@ -238,6 +244,7 @@ def compute_payload(limit: int = None, state_filter: str = None,
     """Main computation function with filtering options for Disease_Data schema"""
     try:
         logger.info("Starting metal pollution analysis")
+        global _last_map_html
 
         client = get_mongo_client()
         try:
@@ -439,11 +446,23 @@ def compute_payload(limit: int = None, state_filter: str = None,
                     popup=folium.Popup(popup_html, max_width=320)
                 ).add_to(m)
 
-            static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
-            os.makedirs(static_dir, exist_ok=True)
-            map_path = os.path.join(static_dir, 'india_metal_pollution_map.html')
-            m.save(map_path)
-            map_url_path = '/static/india_metal_pollution_map.html'
+            # Render Folium map to HTML string and cache it for /api/map
+            try:
+                _last_map_html = m.get_root().render()
+            except Exception as e:
+                logger.error(f"Map render-to-string error: {e}")
+                _last_map_html = None
+
+            # Optional: write to ephemeral /tmp (commonly writeable on PaaS)
+            try:
+                tmp_dir = os.path.join('/tmp', 'metalsense_static')
+                os.makedirs(tmp_dir, exist_ok=True)
+                m.save(os.path.join(tmp_dir, 'india_metal_pollution_map.html'))
+            except Exception as e:
+                logger.warning(f"Map write to /tmp failed: {e}")
+
+            # Always serve via API to avoid filesystem constraints
+            map_url_path = '/api/map'
 
         except Exception as e:
             logger.error(f"Map generation error: {e}")
@@ -492,6 +511,75 @@ def compute_payload(limit: int = None, state_filter: str = None,
         }
 
 
+# Helper functions for area-wise aggregation and plotting
+
+def aggregate_indices_by_area(results: List[Dict[str, Any]], by: str = 'state', index: str = 'PLI') -> List[Tuple[str, float]]:
+    """Aggregate index values by area key and return sorted averages desc.
+    by: one of 'state', 'district', 'location', 'date'
+    index: one of 'PLI', 'NPI', 'HEI', 'TotalER'
+    """
+    valid_by = by if by in ('state', 'district', 'location', 'date') else 'state'
+    sums: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+
+    for r in results:
+        key = str(r.get(valid_by, '') or 'Unknown')
+        value = r.get('indices', {}).get(index)
+        if value is None:
+            continue
+        try:
+            v = float(value)
+        except Exception:
+            continue
+        sums[key] = sums.get(key, 0.0) + v
+        counts[key] = counts.get(key, 0) + 1
+
+    averages: List[Tuple[str, float]] = [(k, (sums[k] / counts[k])) for k in counts]
+    # Sort by descending average
+    averages.sort(key=lambda x: x[1], reverse=True)
+    return averages
+
+
+def render_indices_plot(agg_data: List[Tuple[str, float]], chart_type: str = 'bar', index: str = 'PLI', by: str = 'state', top: int = 10) -> bytes:
+    """Render a chart (bar/line) from aggregated data and return PNG bytes."""
+    labels = [k for k, _ in agg_data]
+    values = [v for _, v in agg_data]
+
+    # Reasonable width based on number of labels
+    fig_w = max(8, min(20, 0.6 * max(1, len(labels))))
+    fig_h = 4.8
+    plt.figure(figsize=(fig_w, fig_h), dpi=150)
+
+    if chart_type not in ('bar', 'line'):
+        chart_type = 'bar'
+
+    if chart_type == 'bar':
+        bars = plt.bar(labels, values, color='#1f77b4')
+        # Add value labels on bars for readability when small
+        if len(values) <= 20:
+            for bar, val in zip(bars, values):
+                plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{val:.2f}",
+                         ha='center', va='bottom', fontsize=8)
+    else:
+        plt.plot(labels, values, marker='o', linestyle='-', color='#1f77b4')
+        if len(values) <= 50:
+            for x, y in zip(labels, values):
+                plt.text(x, y, f"{y:.2f}", ha='center', va='bottom', fontsize=8)
+
+    plt.title(f"Average {index} by {by.capitalize()} (Top {top})")
+    plt.ylabel(index)
+    plt.xlabel(by.capitalize())
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    plt.close()
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # Flask application
 app = Flask(__name__)
 
@@ -509,6 +597,22 @@ CORS(app, resources={
 def static_files(filename):
     static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
     return send_from_directory(static_dir, filename)
+
+@app.route('/api/map', methods=['GET'])
+def get_map():
+    """Serve the last generated Folium map as HTML"""
+    try:
+        global _last_map_html
+        if _last_map_html:
+            resp = make_response(_last_map_html)
+            resp.headers['Content-Type'] = 'text/html; charset=utf-8'
+            # Intentionally avoid setting X-Frame-Options to allow embedding
+            return resp
+        else:
+            return ("<html><body><p>Map not generated yet. Please run /api/analyze first.</p></body></html>", 404)
+    except Exception as e:
+        logger.error(f"/api/map error: {e}")
+        return ("<html><body><p>Map error</p></body></html>", 500)
 
 
 @app.route('/health', methods=['GET'])

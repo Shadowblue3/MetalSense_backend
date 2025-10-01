@@ -780,6 +780,52 @@ def get_statistics():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route('/api/plot', methods=['GET'])
+def plot_indices():
+    """
+    Generate and return a PNG plot of metal indices using current analysis results.
+    Query parameters:
+    - index: One of PLI, NPI, HEI, TotalER (default: PLI)
+    - by: One of state, district, location, date (default: state)
+    - chart: bar or line (default: bar)
+    - top: Number of top areas to include (default: 10)
+    - state, district, min_risk, limit: Optional filters forwarded to analysis
+    """
+    try:
+        index = request.args.get('index', 'PLI')
+        by = request.args.get('by', 'state')
+        chart_type = request.args.get('chart', 'bar')
+        top = request.args.get('top', default=10, type=int)
+
+        limit = request.args.get('limit', type=int)
+        state_filter = request.args.get('state', type=str)
+        district_filter = request.args.get('district', type=str)
+        min_risk = request.args.get('min_risk', type=float)
+
+        payload = compute_payload(
+            limit=limit,
+            state_filter=state_filter,
+            district_filter=district_filter,
+            min_risk=min_risk
+        )
+
+        if not payload.get('success') or not payload.get('data'):
+            return make_response('No data available for plotting', 404)
+
+        results = payload['data']
+        agg = aggregate_indices_by_area(results, by=by, index=index)
+        topn = agg[:max(1, top)]
+        img_bytes = render_indices_plot(topn, chart_type=chart_type, index=index, by=by, top=len(topn))
+
+        resp = make_response(img_bytes)
+        resp.headers['Content-Type'] = 'image/png'
+        resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        return resp
+    except Exception as e:
+        logger.error(f"/api/plot error: {e}", exc_info=True)
+        return make_response('Plot generation error', 500)
+
+
 def signal_handler(sig, frame):
     logger.info('Gracefully shutting down Flask server')
     global _mongo_client

@@ -580,6 +580,20 @@ def render_indices_plot(agg_data: List[Tuple[str, float]], chart_type: str = 'ba
     return buf.getvalue()
 
 
+def render_message_plot(message: str, subtext: str = None) -> bytes:
+    """Render a simple placeholder PNG with a message (used when no data/errors)."""
+    plt.figure(figsize=(8, 4.5), dpi=150)
+    plt.axis('off')
+    plt.text(0.5, 0.6, message, ha='center', va='center', fontsize=14, weight='bold')
+    if subtext:
+        plt.text(0.5, 0.4, subtext, ha='center', va='center', fontsize=10)
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    plt.close()
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # Flask application
 app = Flask(__name__)
 
@@ -784,6 +798,7 @@ def get_statistics():
 def plot_indices():
     """
     Generate and return a PNG plot of metal indices using current analysis results.
+    Always returns image/png (renders a placeholder if no data or error).
     Query parameters:
     - index: One of PLI, NPI, HEI, TotalER (default: PLI)
     - by: One of state, district, location, date (default: state)
@@ -809,13 +824,18 @@ def plot_indices():
             min_risk=min_risk
         )
 
-        if not payload.get('success') or not payload.get('data'):
-            return make_response('No data available for plotting', 404)
-
-        results = payload['data']
-        agg = aggregate_indices_by_area(results, by=by, index=index)
-        topn = agg[:max(1, top)]
-        img_bytes = render_indices_plot(topn, chart_type=chart_type, index=index, by=by, top=len(topn))
+        if not payload.get('success'):
+            img_bytes = render_message_plot('Analysis failed', payload.get('error') or 'Unable to compute payload')
+        elif not payload.get('data'):
+            img_bytes = render_message_plot('No data available for plotting', 'Try removing filters or increasing limit')
+        else:
+            results = payload['data']
+            agg = aggregate_indices_by_area(results, by=by, index=index)
+            if not agg:
+                img_bytes = render_message_plot('No aggregation available', f"by={by}, index={index}")
+            else:
+                topn = agg[:max(1, top)]
+                img_bytes = render_indices_plot(topn, chart_type=chart_type, index=index, by=by, top=len(topn))
 
         resp = make_response(img_bytes)
         resp.headers['Content-Type'] = 'image/png'
@@ -823,7 +843,12 @@ def plot_indices():
         return resp
     except Exception as e:
         logger.error(f"/api/plot error: {e}", exc_info=True)
-        return make_response('Plot generation error', 500)
+        # Return a PNG error image instead of text to keep content-type stable
+        img_bytes = render_message_plot('Plot generation error', str(e))
+        resp = make_response(img_bytes)
+        resp.headers['Content-Type'] = 'image/png'
+        resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        return resp
 
 
 def signal_handler(sig, frame):
